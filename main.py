@@ -4,7 +4,9 @@ Provides list_databases, list_tables, and run_query tools
 """
 import os
 import json
-from urllib.parse import urlparse, unquote
+import logging
+import ssl
+from urllib.parse import urlparse, unquote, parse_qs
 from dotenv import load_dotenv
 import pymysql
 from mcp.server import Server
@@ -13,6 +15,12 @@ from mcp.types import Tool, TextContent
 import uvicorn
 
 load_dotenv()
+
+logging.basicConfig(
+    level=logging.DEBUG if os.getenv("DEBUG", "").lower() in ("1", "true", "yes") else logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("mysql-mcp")
 
 # MySQL connection settings
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -23,7 +31,8 @@ BIND_PORT = int(os.getenv("PORT", "8002"))
 
 
 def _parse_database_url(url):
-    """Parse MySQL DATABASE_URL into connection kwargs."""
+    """Parse MySQL DATABASE_URL into connection kwargs (supports PlanetScale SSL)."""
+    logger.debug("Parsing DATABASE_URL (host/user/database only)")
     parsed = urlparse(url)
     if "@" in parsed.netloc:
         auth, hostport = parsed.netloc.rsplit("@", 1)
@@ -34,27 +43,41 @@ def _parse_database_url(url):
         hostport = parsed.netloc
     host, _, port = hostport.partition(":")
     port = int(port) if port else 3306
-    database = (parsed.path or "").strip("/") or None
-    return {
+    database = (parsed.path or "").strip("/").split("?")[0] or None
+    kwargs = {
         "host": host or "localhost",
         "port": port,
         "user": user,
         "password": password,
         "database": database,
     }
+    # PlanetScale and many cloud DBs require SSL (pymysql needs SSLContext, not True)
+    qs = parse_qs(parsed.query)
+    if "ssl_mode" in qs or "sslaccept" in qs or (host and "psdb.cloud" in host):
+        kwargs["ssl"] = ssl.create_default_context()
+        logger.debug("SSL enabled for connection")
+    logger.debug("Parsed connection: host=%s port=%s user=%s database=%s", kwargs["host"], kwargs["port"], kwargs["user"], kwargs["database"])
+    return kwargs
 
 
 def get_connection():
-    """Create a read-only MySQL connection."""
+    """Create a read-only MySQL connection (best-effort read-only on PlanetScale/Vitess)."""
+    logger.debug("Creating MySQL connection")
     kwargs = _parse_database_url(DATABASE_URL)
     conn = pymysql.connect(**kwargs)
-    with conn.cursor() as cur:
-        cur.execute("SET SESSION transaction_read_only = 1")
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET SESSION transaction_read_only = 1")
+        logger.debug("Connection established, read-only session set")
+    except Exception as e:
+        # PlanetScale/Vitess may not support transaction_read_only
+        logger.debug("Could not set read-only session (ignored): %s", e)
     return conn
 
 
 def list_databases():
     """List all databases in MySQL."""
+    logger.debug("list_databases called")
     conn = get_connection()
     try:
         with conn.cursor() as cur:
@@ -64,6 +87,7 @@ def list_databases():
                 "ORDER BY schema_name"
             )
             databases = [row[0] for row in cur.fetchall()]
+        logger.debug("list_databases returned %d databases: %s", len(databases), databases)
         return databases
     finally:
         conn.close()
@@ -71,6 +95,7 @@ def list_databases():
 
 def list_tables():
     """List all tables in the database."""
+    logger.debug("list_tables called")
     conn = get_connection()
     try:
         with conn.cursor() as cur:
@@ -81,6 +106,7 @@ def list_tables():
                 ORDER BY table_schema, table_name
             """)
             tables = [{"schema": row[0], "table": row[1]} for row in cur.fetchall()]
+        logger.debug("list_tables returned %d tables", len(tables))
         return tables
     finally:
         conn.close()
@@ -88,6 +114,7 @@ def list_tables():
 
 def run_query(query: str):
     """Run a read-only SQL query and return results."""
+    logger.debug("run_query called: %s", query[:200] + "..." if len(query) > 200 else query)
     conn = get_connection()
     try:
         with conn.cursor() as cur:
@@ -95,8 +122,10 @@ def run_query(query: str):
             if cur.description:
                 columns = [desc[0] for desc in cur.description]
                 rows = cur.fetchall()
+                logger.debug("run_query returned %d rows, %d columns", len(rows), len(columns))
                 return {"columns": columns, "rows": rows}
             else:
+                logger.debug("run_query executed (no result set)")
                 return {"message": "Query executed (read-only mode)"}
     finally:
         conn.close()
@@ -108,6 +137,7 @@ server = Server("mysql-mcp")
 
 @server.list_tools()
 async def handle_list_tools():
+    logger.debug("handle_list_tools called")
     return [
         Tool(
             name="list_databases",
@@ -138,6 +168,7 @@ async def handle_list_tools():
 
 @server.call_tool()
 async def handle_call_tool(name: str, arguments: dict):
+    logger.debug("handle_call_tool: name=%s arguments=%s", name, arguments)
     try:
         if name == "list_databases":
             result = list_databases()
@@ -161,6 +192,7 @@ async def handle_call_tool(name: str, arguments: dict):
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
     except Exception as e:
+        logger.exception("handle_call_tool error: %s", e)
         return [TextContent(type="text", text=f"Error: {str(e)}")]
 
 
@@ -169,13 +201,16 @@ sse = SseServerTransport("/messages/")
 
 
 async def handle_sse(scope, receive, send):
+    logger.debug("SSE connection opened")
     async with sse.connect_sse(scope, receive, send) as streams:
         await server.run(
             streams[0], streams[1], server.create_initialization_options()
         )
+    logger.debug("SSE connection closed")
 
 
 async def handle_messages(scope, receive, send):
+    logger.debug("POST /messages request")
     await sse.handle_post_message(scope, receive, send)
 
 
@@ -194,6 +229,7 @@ async def health(scope, receive, send):
 async def app(scope, receive, send):
     if scope["type"] == "http":
         path = scope.get("path", "")
+        logger.debug("HTTP %s %s", scope.get("method", ""), path)
         if path == "/sse":
             await handle_sse(scope, receive, send)
         elif path.startswith("/messages"):
@@ -210,5 +246,5 @@ async def app(scope, receive, send):
 
 
 if __name__ == "__main__":
-    print(f"Starting MySQL MCP Server on {BIND_HOST}:{BIND_PORT}")
+    logger.info("Starting MySQL MCP Server on %s:%s", BIND_HOST, BIND_PORT)
     uvicorn.run(app, host=BIND_HOST, port=BIND_PORT)
